@@ -5,19 +5,10 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from fastapi.testclient import TestClient
 
 import main
 
 SAMPLE_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "sample_data.csv"
-
-
-@pytest.fixture
-def client():
-    main.storage.clear()
-    with TestClient(main.app) as test_client:
-        yield test_client
-    main.storage.clear()
 
 
 def upload_sample(client, filename="sample_data.csv"):
@@ -33,9 +24,13 @@ def test_health(client):
     assert response.json() == {"status": "ok", "version": "1.0.0"}
 
 
-def test_upload_returns_course_fixture_metadata(client):
-    response = upload_sample(client)
+def test_upload_csv(client, sample_csv_bytes):
+    response = client.post(
+        "/upload", files={"file": ("sample_data.csv", sample_csv_bytes, "text/csv")}
+    )
     assert response.status_code == 200
+    assert isinstance(response.json()["id"], int)
+    assert response.json()["id"] > 0
     assert response.json() == {
         "id": 1,
         "filename": "sample_data.csv",
@@ -102,7 +97,7 @@ def test_multiple_uploads_use_separate_ids(client):
     assert client.get("/datasets/2").json()["total_rows"] == 6
 
 
-def test_missing_dataset_returns_404_and_warning(client, caplog):
+def test_retrieve_missing_dataset(client, caplog):
     with caplog.at_level(logging.WARNING, logger="main"):
         response = client.get("/datasets/999")
     assert response.status_code == 404
@@ -182,3 +177,48 @@ def test_docs_expose_response_models_and_endpoints(client):
         "application/json"
     ]["schema"]["$ref"].endswith("/DatasetInfo")
     assert "/datasets/{dataset_id}" in schema["paths"]
+    process = schema["paths"]["/datasets/{dataset_id}/process"]["post"]
+    assert process["requestBody"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ProcessConfig"
+    )
+    assert process["responses"]["200"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("/ProcessingReport")
+
+
+def test_process_and_retrieve(client, uploaded_dataset_id, processing_body):
+    response = client.post(
+        f"/datasets/{uploaded_dataset_id}/process", json=processing_body
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": uploaded_dataset_id,
+        "validation_rows_removed": 1,
+        "cleaning_report": {
+            "rows_before": 5,
+            "rows_after": 3,
+            "rows_removed": 2,
+            "columns_before": 2,
+            "columns_after": 2,
+            "columns_removed": 0,
+        },
+    }
+
+    retrieved = client.get(f"/datasets/{uploaded_dataset_id}")
+    assert retrieved.status_code == 200
+    assert retrieved.json() == {
+        "id": uploaded_dataset_id,
+        "data": [
+            {"student_id": 1, "score": 80},
+            {"student_id": 2, "score": 90},
+            {"student_id": 5, "score": 85},
+        ],
+        "total_rows": 3,
+    }
+    assert main.storage.get_metadata(uploaded_dataset_id) == {
+        "id": uploaded_dataset_id,
+        "filename": "sample_data.csv",
+        "rows": 3,
+        "columns": 2,
+        "column_names": ["student_id", "score"],
+    }

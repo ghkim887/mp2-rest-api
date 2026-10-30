@@ -1,5 +1,6 @@
-"""Public models, storage, and logging utilities."""
+"""Public API models, storage, middleware, and logging utilities."""
 
+from .middleware import log_requests
 from .models import DatasetInfo, HealthResponse, ProcessConfig, ProcessingReport
 from .storage import DatasetStorage
 from .utils import setup_logging
