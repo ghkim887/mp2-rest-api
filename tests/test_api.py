@@ -222,3 +222,185 @@ def test_process_and_retrieve(client, uploaded_dataset_id, processing_body):
         "columns": 2,
         "column_names": ["student_id", "score"],
     }
+
+
+def test_process_missing_dataset_returns_404(client, processing_body):
+    response = client.post("/datasets/999/process", json=processing_body)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Dataset 999 not found."}
+
+
+@pytest.mark.parametrize(
+    "section,changes,detail",
+    [
+        ("validation", {"required_columns": ["missing"]}, "Required column missing: missing"),
+        ("validation", {"numeric_columns": ["missing"]}, "Numeric column missing: missing"),
+        ("missing", {"axis": "invalid"}, "Unsupported missing-value axis: invalid"),
+        (
+            "outliers",
+            {"enabled": True, "columns": ["score"], "method": "invalid"},
+            "Unsupported outlier method: invalid",
+        ),
+        (
+            "outliers",
+            {"enabled": True, "columns": ["score"], "threshold": -1},
+            "Invalid outlier threshold: -1.0",
+        ),
+    ],
+)
+def test_failed_processing_preserves_original_data(
+    client, uploaded_dataset_id, processing_body, section, changes, detail
+):
+    if section == "validation":
+        processing_body[section].update(changes)
+    else:
+        processing_body["processing"][section].update(changes)
+    before = main.storage.get(uploaded_dataset_id)
+    metadata_before = main.storage.get_metadata(uploaded_dataset_id)
+
+    response = client.post(
+        f"/datasets/{uploaded_dataset_id}/process", json=processing_body
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": detail}
+    pd.testing.assert_frame_equal(main.storage.get(uploaded_dataset_id), before)
+    assert main.storage.get_metadata(uploaded_dataset_id) == metadata_before
+    retrieved = client.get(f"/datasets/{uploaded_dataset_id}").json()
+    assert retrieved["total_rows"] == 6
+    assert retrieved["data"][4]["score"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [None, [], {"validation": None}, {"processing": {"missing": {"axis": 1}}}],
+    ids=["no-config", "array-config", "null-validation", "invalid-field-type"],
+)
+def test_malformed_processing_body_returns_422_without_changes(client, uploaded_dataset_id, body):
+    before = main.storage.get(uploaded_dataset_id)
+    response = client.post(f"/datasets/{uploaded_dataset_id}/process", json=body)
+    assert response.status_code == 422
+    pd.testing.assert_frame_equal(main.storage.get(uploaded_dataset_id), before)
+
+
+def test_processing_uses_nested_defaults(client, uploaded_dataset_id):
+    response = client.post(
+        f"/datasets/{uploaded_dataset_id}/process",
+        json={"validation": {"numeric_columns": ["score"]}},
+    )
+    assert response.status_code == 200
+    assert response.json()["validation_rows_removed"] == 1
+    assert response.json()["cleaning_report"]["rows_after"] == 3
+
+
+def test_empty_config_cleans_without_numeric_validation(client, uploaded_dataset_id):
+    response = client.post(f"/datasets/{uploaded_dataset_id}/process", json={})
+    assert response.status_code == 200
+    assert response.json()["validation_rows_removed"] == 0
+    assert response.json()["cleaning_report"]["rows_before"] == 6
+    assert response.json()["cleaning_report"]["rows_after"] == 4
+    rows = client.get(f"/datasets/{uploaded_dataset_id}").json()["data"]
+    assert [row["student_id"] for row in rows] == [1, 2, 4, 5]
+    assert rows[2]["score"] == "unknown"
+
+
+def test_disabled_processing_steps_preserve_duplicates_and_nulls(
+    client, uploaded_dataset_id, processing_body
+):
+    processing_body["processing"]["remove_duplicates"] = False
+    processing_body["processing"]["missing"]["enabled"] = False
+    response = client.post(
+        f"/datasets/{uploaded_dataset_id}/process", json=processing_body
+    )
+    assert response.status_code == 200
+    assert response.json()["validation_rows_removed"] == 1
+    assert response.json()["cleaning_report"]["rows_removed"] == 0
+    rows = client.get(f"/datasets/{uploaded_dataset_id}").json()["data"]
+    assert [row["student_id"] for row in rows] == [1, 2, 2, 3, 5]
+    assert rows[3]["score"] is None
+
+
+def test_missing_column_removal_refreshes_storage_metadata(
+    client, uploaded_dataset_id, processing_body
+):
+    processing_body["processing"]["missing"]["axis"] = "columns"
+    response = client.post(
+        f"/datasets/{uploaded_dataset_id}/process", json=processing_body
+    )
+    assert response.status_code == 200
+    assert response.json()["cleaning_report"] == {
+        "rows_before": 5, "rows_after": 4, "rows_removed": 1,
+        "columns_before": 2, "columns_after": 1, "columns_removed": 1,
+    }
+    assert main.storage.get_metadata(uploaded_dataset_id)["column_names"] == ["student_id"]
+    assert client.get(f"/datasets/{uploaded_dataset_id}").json()["data"] == [
+        {"student_id": student_id} for student_id in [1, 2, 3, 5]
+    ]
+
+
+@pytest.mark.parametrize("method", ["iqr", "zscore"])
+def test_outlier_methods_reuse_mp1_behavior(client, processing_body, method):
+    uploaded = client.post(
+        "/upload", files={"file": ("outliers.csv", b"value\n10\n11\n12\n13\n100\n", "text/csv")}
+    )
+    assert uploaded.status_code == 200
+    dataset_id = uploaded.json()["id"]
+    processing_body["validation"] = {"required_columns": ["value"], "numeric_columns": ["value"]}
+    processing_body["processing"]["outliers"].update(
+        {"enabled": True, "columns": ["value"], "method": method}
+    )
+    response = client.post(f"/datasets/{dataset_id}/process", json=processing_body)
+    assert response.status_code == 200
+    assert response.json()["cleaning_report"]["rows_removed"] == 1
+    assert client.get(f"/datasets/{dataset_id}").json()["data"] == [
+        {"value": value} for value in [10, 11, 12, 13]
+    ]
+
+
+def test_disabled_steps_ignore_unsupported_axis_and_method(
+    client, uploaded_dataset_id, processing_body
+):
+    processing_body["processing"]["missing"] = {"enabled": False, "axis": "invalid"}
+    processing_body["processing"]["outliers"]["method"] = "invalid"
+    response = client.post(
+        f"/datasets/{uploaded_dataset_id}/process", json=processing_body
+    )
+    assert response.status_code == 200
+    assert response.json()["cleaning_report"]["rows_after"] == 4
+
+
+def test_processing_leaves_other_uploads_unchanged(client, uploaded_dataset_id, processing_body):
+    second_id = upload_sample(client).json()["id"]
+    before = main.storage.get(second_id)
+    assert client.post(
+        f"/datasets/{uploaded_dataset_id}/process", json=processing_body
+    ).status_code == 200
+    pd.testing.assert_frame_equal(main.storage.get(second_id), before)
+    assert client.get(f"/datasets/{second_id}").json()["total_rows"] == 6
+
+
+def test_repeated_processing_reports_current_data(client, uploaded_dataset_id, processing_body):
+    endpoint = f"/datasets/{uploaded_dataset_id}/process"
+    assert client.post(endpoint, json=processing_body).status_code == 200
+    repeated = client.post(endpoint, json=processing_body)
+    assert repeated.status_code == 200
+    assert repeated.json() == {
+        "id": uploaded_dataset_id,
+        "validation_rows_removed": 0,
+        "cleaning_report": {
+            "rows_before": 3, "rows_after": 3, "rows_removed": 0,
+            "columns_before": 2, "columns_after": 2, "columns_removed": 0,
+        },
+    }
+
+
+def test_processing_logs_major_results(client, uploaded_dataset_id, processing_body, caplog):
+    with caplog.at_level(logging.INFO, logger="main"):
+        response = client.post(
+            f"/datasets/{uploaded_dataset_id}/process", json=processing_body
+        )
+    assert response.status_code == 200
+    assert f"Validated dataset: id={uploaded_dataset_id}, rows_before=6, rows_after=5" in caplog.text
+    assert (
+        f"Processed dataset: id={uploaded_dataset_id}, validation_removed=1, rows_before=5, rows_after=3"
+        in caplog.text
+    )
